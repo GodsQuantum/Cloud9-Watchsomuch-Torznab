@@ -1,0 +1,19 @@
+name: cloud9-watchsomuch-torznab
+services:
+  torznab:
+    image: ghcr.io/godsquantum/cloud9-watchsomuch-torznab:latest
+    pull_policy: always
+    restart: unless-stopped
+    read_only: true
+    user: "1000:1000"
+    env_file: .env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - torznab-cache:/cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  torznab-cache:

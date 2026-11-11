@@ -1,0 +1,105 @@
+name: Test and publish Cloud9 WatchSoMuch Torznab GHCR
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "35 5 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: watchsomuch-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Privacy, logo and public-source gates
+        run: python3 tests/privacy.py
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test exactly the source code shipped in the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -count=1 ./...
+          go vet ./...
+          echo WATCHSOMUCH_GO_UNIT_AND_RACE_PASS
+      - uses: docker/setup-buildx-action@v3
+      - name: Build minimal scratch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          load: true
+          platforms: linux/amd64
+          tags: local/cloud9-watchsomuch:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Real Docker /health, unauthorized Torznab and authenticated XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --rm --name cloud9-watchsomuch-smoke \
+            -e TORZNAB_API_KEY=synthetic-ci-only \
+            -e WSM_SITE=https://example.invalid \
+            -p 127.0.0.1:18787:8787 local/cloud9-watchsomuch:test
+          trap 'docker rm -f cloud9-watchsomuch-smoke >/dev/null 2>&1 || true' EXIT
+          success=0
+          for i in $(seq 1 20); do
+            code="$(curl --max-time 2 -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18787/health || true)"
+            if [ "$code" = 200 ]; then success=1;break;fi
+            sleep 1
+          done
+          test "$success" = 1
+          test "$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:18787/api?t=caps')" = 401
+          curl -fsS --max-time 5 'http://127.0.0.1:18787/api?t=caps&apikey=synthetic-ci-only' > /tmp/wsm-caps.xml
+          python3 - <<'PY'
+          import xml.etree.ElementTree as E
+          root=E.parse('/tmp/wsm-caps.xml').getroot()
+          assert root.tag=='caps'
+          cats={int(c.attrib['id']) for c in root.findall('./categories/category')}
+          assert {2000,5000}<=cats
+          searches={x.tag:x.attrib.get('available') for x in root.findall('./searching/*')}
+          assert searches=={'search':'yes','tv-search':'yes','movie-search':'yes'}
+          print('WATCHSOMUCH_DOCKER_200_401_TORZNAB_XML_PASS')
+          PY
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: metadata
+        with:
+          images: ghcr.io/godsquantum/cloud9-watchsomuch-torznab
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: |
+            ${{ steps.metadata.outputs.labels }}
+            org.opencontainers.image.source=https://github.com/GodsQuantum/Cloud9-Watchsomuch-Torznab
+            org.opencontainers.image.title=Cloud9-Watchsomuch-Torznab
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
